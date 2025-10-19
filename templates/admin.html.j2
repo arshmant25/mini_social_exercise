@@ -56,7 +56,23 @@
                     {% for user in users %}
                     <tr>
                         <td>{{ user.id }}</td>
-                        <td><a href="{{ url_for('user_profile', username=user.username) }}">{{ user.username }}</a></td>
+                        <td><a href="{{ url_for('user_profile', username=user.username) }}">{{ user.username }}</a>
+
+                        {% if user.risk_label %}
+                            {% if user.risk_label == "HIGH" %}
+                                <span class="badge bg-danger ms-2">{{ user.risk_label }}</span>
+                            {% elif user.risk_label == "MEDIUM" %}
+                                <span class="badge bg-warning text-dark ms-2">{{ user.risk_label }}</span>
+                            {% elif user.risk_label == "LOW" %}
+                                <span class="badge bg-info text-dark ms-2">{{ user.risk_label }}</span>
+                            {% else %}
+                                <span class="badge bg-secondary ms-2">{{ user.risk_label }}</span>
+                            {% endif %}
+                            <span class="ms-1">({{ user.risk_score }})</span>
+                        {% endif %}
+                        </td>
+
+
                         <td style="max-width: 300px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;" title="{{ user.profile or 'N/A' }}">{{ user.profile or 'N/A' }}</td>
                         <td>{{ user.created_at|datetimeformat }}</td>
                         <td>

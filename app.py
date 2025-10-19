@@ -23,9 +23,11 @@ with open(ENCRYPTED_FILE_PATH, 'rb') as encrypted_file:
     encrypted_data = encrypted_file.read()
 decrypted_data = fernet.decrypt(encrypted_data)
 MODERATION_CONFIG = json.loads(decrypted_data)
+print(MODERATION_CONFIG)
 TIER1_WORDS = MODERATION_CONFIG['categories']['tier1_severe_violations']['words']
 TIER2_PHRASES = MODERATION_CONFIG['categories']['tier2_spam_scams']['phrases']
 TIER3_WORDS = MODERATION_CONFIG['categories']['tier3_mild_profanity']['words']
+print('TIER3_WORDS are',TIER3_WORDS)
 
 def get_db():
     """
@@ -177,14 +179,15 @@ def feed():
         reactions = query_db('SELECT reaction_type, COUNT(*) as count FROM reactions WHERE post_id = ? GROUP BY reaction_type', (post['id'],))
         comments_raw = query_db('SELECT c.id, c.content, c.created_at, u.username, u.id as user_id FROM comments c JOIN users u ON c.user_id = u.id WHERE c.post_id = ? ORDER BY c.created_at ASC', (post['id'],))
         post_dict = dict(post)
-        post_dict['content'], _ = moderate_content(post_dict['content'])
+        post_dict['content'],post_dict['score']  = moderate_content(post_dict['content'])
         comments_moderated = []
         for comment in comments_raw:
             comment_dict = dict(comment)
-            comment_dict['content'], _ = moderate_content(comment_dict['content'])
+            comment_dict['content'], comment_dict['score'] = moderate_content(comment_dict['content'])
             comments_moderated.append(comment_dict)
         posts_data.append({
             'post': post_dict,
+            'score': post_dict['score'],
             'reactions': reactions,
             'user_reaction': user_reaction,
             'followed_poster': followed_poster,
@@ -277,8 +280,9 @@ def user_profile(username):
         abort(404)
 
     user = dict(user_raw)
-    moderated_bio, _ = moderate_content(user.get('profile', ''))
+    moderated_bio, bio_score = moderate_content(user.get('profile', ''))
     user['profile'] = moderated_bio
+    user['bio_score'] = bio_score
 
     posts_raw = query_db('SELECT id, content, user_id, created_at FROM posts WHERE user_id = ? ORDER BY created_at DESC', (user['id'],))
     posts = []
@@ -870,7 +874,7 @@ def loop_color(user_id):
 # ----- Functions to be implemented are below
 
 # Task 3.1
-def recommend(user_id, filter_following):
+def recommend(user_id):
     """
     Args:
         user_id: The ID of the current user.
@@ -890,9 +894,80 @@ def recommend(user_id, filter_following):
     - https://www.researchgate.net/publication/227268858_Recommender_Systems_Handbook
     """
 
-    recommended_posts = {} 
+    # --- 1️⃣ Get the content of all posts the user has liked (reacted positively) ---
+    liked_posts_content = query_db('''
+        SELECT p.content FROM posts p
+        JOIN reactions r ON p.id = r.post_id
+        WHERE r.user_id = ? AND r.reaction_type = "like"
+    ''', (user_id,))
 
-    return recommended_posts;
+    # --- 2️⃣ If the user hasn't liked any posts, fall back to recent posts from followed users ---
+    if not liked_posts_content:
+        followed_posts = query_db('''
+            SELECT p.id, p.content, p.created_at, u.username, u.id as user_id
+            FROM posts p 
+            JOIN users u ON p.user_id = u.id
+            WHERE p.user_id IN (SELECT followed_id FROM follows WHERE follower_id = ?)
+              AND p.user_id != ?
+            ORDER BY p.created_at DESC
+            LIMIT 5
+        ''', (user_id, user_id))
+
+        # If no follows either, just return 5 latest posts
+        if not followed_posts:
+            return query_db('''
+                SELECT p.id, p.content, p.created_at, u.username, u.id as user_id
+                FROM posts p 
+                JOIN users u ON p.user_id = u.id
+                WHERE p.user_id != ?
+                ORDER BY p.created_at DESC
+                LIMIT 5
+            ''', (user_id,))
+        return followed_posts
+
+    # --- 3️⃣ Find the most common keywords in liked posts ---
+    word_counts = collections.Counter()
+    stop_words = {'a', 'an', 'the', 'in', 'on', 'is', 'it', 'to', 'for', 'of', 'and', 'with', 'that', 'this', 'as',
+                  'at', 'by'}
+
+    for post in liked_posts_content:
+        words = re.findall(r'\b\w+\b', post['content'].lower())
+        for word in words:
+            if word not in stop_words and len(word) > 2:
+                word_counts[word] += 1
+
+    top_keywords = [word for word, _ in word_counts.most_common(10)]
+
+    # --- 4️⃣ Get all posts (excluding user’s own posts and already liked ones) ---
+    all_other_posts = query_db('''
+        SELECT p.id, p.content, p.created_at, u.username, u.id as user_id
+        FROM posts p 
+        JOIN users u ON p.user_id = u.id
+        WHERE p.user_id != ?
+    ''', (user_id,))
+
+    liked_post_ids = {post['id'] for post in
+                      query_db('SELECT post_id as id FROM reactions WHERE user_id = ?', (user_id,))}
+
+    recommended_posts = []
+    for post in all_other_posts:
+        if post['id'] in liked_post_ids or post['user_id'] == user_id:
+            continue
+
+        # If post is from a followed user OR shares a keyword with liked posts
+        is_followed = query_db(
+            'SELECT 1 FROM follows WHERE follower_id = ? AND followed_id = ?',
+            (user_id, post['user_id']),
+            one=True
+        )
+        shares_keyword = any(keyword in post['content'].lower() for keyword in top_keywords)
+
+        if is_followed or shares_keyword:
+            recommended_posts.append(post)
+
+    # --- 5️⃣ Sort by most recent and limit to 5 ---
+    recommended_posts.sort(key=lambda p: p['created_at'], reverse=True)
+    return recommended_posts[:5]
 
 # Task 3.2
 def user_risk_analysis(user_id):
@@ -901,18 +976,97 @@ def user_risk_analysis(user_id):
         user_id: The ID of the user on which we perform risk analysis.
 
     Returns:
-        A float number score showing the risk associated with this user. There are no strict rules or bounds to this score, other than that a score of less than 1.0 means no risk, 1.0 to 3.0 is low risk, 3.0 to 5.0 is medium risk and above 5.0 is high risk. (An upper bound of 5.0 is applied to this score elsewhere in the codebase) 
-        
-        You will be able to check the scores by logging in with the administrator account:
-            username: admin
-            password: admin
-        Then, navigate to the /admin endpoint. (http://localhost:8080/admin)
+        A float number score showing the risk associated with this user.
+        There are no strict rules or bounds to this score, other than that
+        a score of less than 1.0 means no risk, 1.0 to 3.0 is low risk,
+        3.0 to 5.0 is medium risk and above 5.0 is high risk.
+        (An upper bound of 5.0 is applied elsewhere in the codebase)
     """
-    
+
     score = 0
+    score1 = 0
+    top_5_risky_users = []
 
-    return score;
+    # 🔹 If you only want to analyze one user, use WHERE id = ?
+    all_users = query_db("""
+        SELECT id, username, profile,
+               (julianday('now') - julianday(created_at)) AS days_since_creation
+        FROM users
+        where username != 'admin'
+    """)
 
+    for user in all_users:
+        user_id = user['id']
+        username = user['username']
+        user_since_created = user['days_since_creation']
+        score = 0
+        score1 = 0
+
+        print(f"\n=== Analyzing User ID: {user_id} ({username}) ===")
+        print(f"User created {user_since_created:.0f} days ago")
+
+        # --- Profile ---
+        content = user['profile'] or ""
+        _, profile_score = moderate_content(content)
+        print(f"Profile score of {user_id}: {profile_score}")
+
+        # --- Posts ---
+        user_posts = query_db('SELECT content FROM posts WHERE user_id = ?', (user_id,))
+        print(f"Found {len(user_posts)} posts.")
+        for post in user_posts:
+            _, post_risk_score = moderate_content(post['content'])
+            score += post_risk_score
+            print(f"  Post → Score: {post_risk_score}")
+        avg_post_score = score / len(user_posts) if user_posts else 0
+        print(f"Total post score: {score}, Avg: {avg_post_score}")
+
+        # --- Comments ---
+        user_comments = query_db('SELECT content FROM comments WHERE user_id = ?', (user_id,))
+        print(f"Found {len(user_comments)} comments.")
+        for comment in user_comments:
+            _, comment_risk_score = moderate_content(comment['content'])
+            score1 += comment_risk_score
+            print(f"  Comment → Score: {comment_risk_score}")
+        avg_comment_score = score1 / len(user_comments) if user_comments else 0
+        print(f"Total comment score: {score1}, Avg: {avg_comment_score}")
+
+        # --- Combined Risk ---
+        content_risk_score = (profile_score * 1) + (avg_post_score * 3) + (avg_comment_score * 1)
+        print(f"Content risk score: {content_risk_score}")
+
+        # --- Age multiplier ---
+        if user_since_created < 7:
+            user_risk_score = content_risk_score * 1.5
+        elif user_since_created < 30:
+            user_risk_score = content_risk_score * 1.2
+        else:
+            user_risk_score = content_risk_score
+
+        print(f"Final user risk score: {user_risk_score}")
+
+        # --- Collect user data ---
+        top_5_risky_users.append({
+            'id': user_id,
+            'username': username,
+            'user_risk_score': user_risk_score
+        })
+
+        # --- New Risk Prediction Measure: Posting Frequency ---
+        activity_rate = (len(user_posts) + len(user_comments)) / (user_since_created + 1)
+        if activity_rate > 5:
+            print(f"⚠️ High activity rate detected for {username} ({activity_rate:.2f}/day) — increasing risk.")
+
+    # --- Sort and display Top 5 ---
+    top_users = sorted(top_5_risky_users, key=lambda x: x['user_risk_score'], reverse=True)
+    top_5_users = top_users[:5]
+
+    print("\n=== Top 5 Highest-Risk Users ===")
+    for idx, user in enumerate(top_5_users, start=1):
+        print(f"{idx}. {user['username']} (ID: {user['id']}) → Risk Score: {user['user_risk_score']:.2f}")
+
+
+
+    return top_5_users
     
 # Task 3.3
 def moderate_content(content):
@@ -932,9 +1086,59 @@ def moderate_content(content):
     Then, navigate to the /admin endpoint. (http://localhost:8080/admin)
     """
 
-    moderated_content = content
+    TIER1_PATTERN = r'\b(' + '|'.join(TIER1_WORDS) + r')\b'
+    TIER2_PATTERN = r'\b(' + '|'.join(TIER2_PHRASES) + r')\b'
+    TIER3_PATTERN = r'\b(' + '|'.join(TIER3_WORDS) + r')\b'
+    URL_PATTERN = r'https?[:.]\S+|www+\.\S+'
+
+    EMAIL_PATTERN = r'\b[\w.-]+@[\w.-]+\.\w+\b'
+    PHONE_PATTERN = r'\b\+?\d{10,15}\b'
+    ADDRESS_PATTERN = r'\d{1,5}\s\w+(?:\s\w+){0,4}'
+
+    original_content = content
+    moderated_content = original_content
     score = 0
-    
+
+    # Tier1
+    if re.search(TIER1_PATTERN, original_content, flags=re.IGNORECASE):
+        score += 5
+        moderated_content = 'content removed due to severe violation'
+
+    # Tier2
+    if re.search(TIER2_PATTERN, original_content, flags=re.IGNORECASE):
+        score += 5
+        moderated_content = 'content removed due to spam/scam policy'
+
+    # Tier3
+    if re.search(TIER3_PATTERN, original_content, flags=re.IGNORECASE):
+        matches = re.findall(TIER3_PATTERN, original_content, flags=re.IGNORECASE)
+        score += len(matches) * 2
+        #print(score)
+        moderated_content = re.sub(TIER3_PATTERN, lambda m: '*' * len(m.group(0)), original_content,
+                                   flags=re.IGNORECASE)
+
+    # URL
+    if re.search(URL_PATTERN, original_content, flags=re.IGNORECASE):
+        matches = re.findall(URL_PATTERN, moderated_content, flags=re.IGNORECASE)
+        score += len(matches) * 2
+        #print(score)
+        moderated_content = re.sub(URL_PATTERN, 'link removed', moderated_content, flags=re.IGNORECASE)
+
+    # Uppercase
+    letters = [c for c in original_content if c.isalpha()]
+    upper_letters = [c for c in original_content if c.isupper()]
+    if len(letters) > 15 and (len(upper_letters) / len(letters)) > 0.7:
+        score += 0.5
+
+    # --- Personal info detection
+    personal_patterns = [EMAIL_PATTERN, PHONE_PATTERN, ADDRESS_PATTERN]
+    for pattern in personal_patterns:
+        if re.search(pattern, moderated_content, flags=re.IGNORECASE):
+            matches = re.findall(pattern, moderated_content, flags=re.IGNORECASE)
+            score += len(matches) * 2  # +2 per match
+            #print(score)
+            moderated_content = re.sub(pattern, 'private info removed', moderated_content,
+                                       flags=re.IGNORECASE)
     return moderated_content, score
 
 
