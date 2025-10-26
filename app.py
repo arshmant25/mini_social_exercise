@@ -8,6 +8,15 @@ import hashlib
 import re
 from datetime import datetime
 
+import pandas as pd
+from gensim.corpora import Dictionary
+from gensim.models.ldamodel import LdaModel
+from gensim.models.coherencemodel import CoherenceModel
+from nltk.corpus import stopwords
+from nltk.tokenize import word_tokenize
+from nltk.stem import WordNetLemmatizer
+import nltk
+
 app = Flask(__name__)
 app.secret_key = '123456789' 
 DATABASE = 'database.sqlite'
@@ -23,11 +32,11 @@ with open(ENCRYPTED_FILE_PATH, 'rb') as encrypted_file:
     encrypted_data = encrypted_file.read()
 decrypted_data = fernet.decrypt(encrypted_data)
 MODERATION_CONFIG = json.loads(decrypted_data)
-print(MODERATION_CONFIG)
+#print(MODERATION_CONFIG)
 TIER1_WORDS = MODERATION_CONFIG['categories']['tier1_severe_violations']['words']
 TIER2_PHRASES = MODERATION_CONFIG['categories']['tier2_spam_scams']['phrases']
 TIER3_WORDS = MODERATION_CONFIG['categories']['tier3_mild_profanity']['words']
-print('TIER3_WORDS are',TIER3_WORDS)
+#print('TIER3_WORDS are',TIER3_WORDS)
 
 def get_db():
     """
@@ -869,6 +878,11 @@ def loop_color(user_id):
     b = int(h[4:6], 16)
     return f'rgb({r % 128 + 80}, {g % 128 + 80}, {b % 128 + 80})'
 
+@app.template_global()
+def get_reputation(user_id):
+    if user_id is None:
+        return 0
+    return user_reputation(user_id)  # returns 0-100 int
 
 
 # ----- Functions to be implemented are below
@@ -979,22 +993,22 @@ def user_risk_analysis(user_id):
         score = 0
         score1 = 0
 
-        print(f"\nAnalyzing User ID: {user_id} ({username})")
-        print(f"User created {user_since_created:.0f} days ago")
+        #print(f"\nAnalyzing User ID: {user_id} ({username})")
+        #print(f"User created {user_since_created:.0f} days ago")
 
         #  Profile
         content = user['profile'] or ""
         _, profile_score = moderate_content(content)
-        print(f"Profile score of {user_id}: {profile_score}")
+        #print(f"Profile score of {user_id}: {profile_score}")
 
         # Posts
         user_posts = query_db('SELECT content FROM posts WHERE user_id = ?', (user_id,))
-        print(f"Found {len(user_posts)} posts.")
+        #print(f"Found {len(user_posts)} posts.")
         high_risk_count = 0
         for post in user_posts:
             _, post_risk_score = moderate_content(post['content'])
             score += post_risk_score
-            print(f"  Post → Score: {post_risk_score}")
+            #print(f"  Post → Score: {post_risk_score}")
 
             if post_risk_score > 0:
                 high_risk_count += 1
@@ -1002,21 +1016,21 @@ def user_risk_analysis(user_id):
         high_risk_ratio = high_risk_count / (len(user_posts) if user_posts else 1)
 
         avg_post_score = score / len(user_posts) if user_posts else 0
-        print(f"Total post score: {score}, Avg: {avg_post_score}")
+        #print(f"Total post score: {score}, Avg: {avg_post_score}")
 
         #  Comments
         user_comments = query_db('SELECT content FROM comments WHERE user_id = ?', (user_id,))
-        print(f"Found {len(user_comments)} comments.")
+        #print(f"Found {len(user_comments)} comments.")
         for comment in user_comments:
             _, comment_risk_score = moderate_content(comment['content'])
             score1 += comment_risk_score
-            print(f"  Comment → Score: {comment_risk_score}")
+            # print(f"  Comment → Score: {comment_risk_score}")
         avg_comment_score = score1 / len(user_comments) if user_comments else 0
-        print(f"Total comment score: {score1}, Avg: {avg_comment_score}")
+        #print(f"Total comment score: {score1}, Avg: {avg_comment_score}")
 
         # --- Combined Risk ---
         content_risk_score = (profile_score * 1) + (avg_post_score * 3) + (avg_comment_score * 1)
-        print(f"Content risk score: {content_risk_score}")
+        #print(f"Content risk score: {content_risk_score}")
 
         # Age multiplier
         if user_since_created < 7:
@@ -1026,14 +1040,16 @@ def user_risk_analysis(user_id):
         else:
             user_risk_score = content_risk_score
 
+
+
+        if high_risk_ratio >= 0.5:
+            #print(f" More than half of the posts are high-risk. Increasing user risk score by 1.")
+            user_risk_score+=1
+
         if user_risk_score > 5:
             user_risk_score = 5
 
-        print(f"Final user risk score: {user_risk_score}")
-
-        if high_risk_ratio >= 0.5:
-            print(f" More than half of the posts are high-risk. Increasing user risk score by 1.")
-            user_risk_score+=1
+        #print(f"Final user risk score: {user_risk_score}")
 
         # Collect user data
         top_5_risky_users.append({
@@ -1045,7 +1061,7 @@ def user_risk_analysis(user_id):
     #Top 5 Users
     top_users = sorted(top_5_risky_users, key=lambda x: x['user_risk_score'], reverse=True)
     top_5_users = top_users[:5]
-    print(f'\nTop 5 Highest Risk Users {top_5_users}')
+    #print(f'\nTop 5 Highest Risk Users {top_5_users}')
 
 
     return user_risk_score
@@ -1154,6 +1170,215 @@ def recommend(user_id,filter_following = True):
 
     recommended_posts.sort(key=lambda p: p['created_at'], reverse=True)
     return recommended_posts[:5]
+
+
+def topics():
+    import nltk
+    from nltk.corpus import stopwords
+    from nltk.tokenize import word_tokenize
+    from nltk.stem import WordNetLemmatizer
+    from gensim.corpora import Dictionary
+    from gensim.models.ldamodel import LdaModel
+    from gensim.models.coherencemodel import CoherenceModel
+
+    # Download necessary NLTK data
+    nltk.download('punkt')
+    nltk.download('punkt_tab')
+    nltk.download('stopwords')
+    nltk.download('wordnet')
+
+    # Load data from your database function
+    contents = query_db('''
+        SELECT p.content
+        FROM posts p
+    ''')
+
+    # Get a basic stopword list
+    stop_words = stopwords.words('english')
+
+    # Add extra words
+    stop_words.extend([
+        'would', 'best', 'always', 'amazing', 'bought', 'quick', 'people', 'new', 'fun', 'think', 'know', 'believe',
+        'many', 'thing', 'need', 'small', 'even', 'make', 'love', 'mean', 'fact', 'question', 'time', 'reason', 'also',
+        'could', 'true', 'well', 'life', 'said', 'year', 'going', 'good', 'really', 'much', 'want', 'back', 'look',
+        'article', 'host', 'university', 'reply', 'thanks', 'mail', 'post', 'please', 'change', 'see', 'let', 'keep',
+        'maybe', 'like', 'get', 'wow',
+        'feel', 'made', 'something', 'sometimes', 'everyone', 'last',
+        'first', 'tried', 'trying', 'like', 'let', 'see', 'get', 'might', 'real', 'way', 'someone',
+        'every', 'else', 'sure', 'little', 'nothing', 'big', 'hey',
+        'made', 'made', 'feel', 'felt', 'try', 'sometimes', 'maybe', 'hit'
+    ])
+
+    # Lemmatizer object
+    lemmatizer = WordNetLemmatizer()
+
+    # Convert posts into bags-of-words
+    bow_list = []
+    for content in contents:
+        text = content['content']
+        tokens = word_tokenize(text.lower())
+        tokens = [lemmatizer.lemmatize(t) for t in tokens]
+        tokens = [t for t in tokens if len(t) > 2]
+        tokens = [t for t in tokens if t.isalpha() and t not in stop_words]
+        if len(tokens) > 0:
+            bow_list.append(tokens)
+
+    print(f'Bow list: {bow_list}')
+
+    # Create dictionary and corpus
+    dictionary = Dictionary(bow_list)
+    dictionary.filter_extremes(no_below=2, no_above=0.3)
+    print(f'Dictionary: {dictionary}')
+    corpus = [dictionary.doc2bow(tokens) for tokens in bow_list]
+    print(f'Corpus: {corpus}')
+
+    # Train LDA model (using fixed number of topics for simplicity)
+    optimal_k = 10
+    lda = LdaModel(corpus, num_topics=optimal_k, id2word=dictionary, passes=10, random_state=2)
+
+    # Compute coherence
+    coherence_model = CoherenceModel(model=lda, texts=bow_list, dictionary=dictionary, coherence='c_v')
+    coherence_score = coherence_model.get_coherence()
+    print(f'Coherence score: {coherence_score}')
+
+    # Print top 5 words per topic
+    print(f'Top 5 words per topic:')
+    for i, topic in lda.print_topics(num_words=5):
+        print(f"Topic {i}: {topic}")
+
+    topic_labels = {
+        0: "Mental Health",
+        1: "Productivity & Renewable Energy",
+        2: "Family Life",
+        3: "Local Activities",
+        4: "Documentaries & Reflections",
+        5: "Weekend Activities",
+        6: "Personal Growth",
+        7: "Coffee & Reading",
+        8: "Nature",
+        9: "Community & Kindness "
+    }
+
+    # Create a list to store detailed topic information for each document
+    doc_topics = []
+
+    # Count the dominant topic for each document
+    topic_counts = [0] * optimal_k  # one counter per topic
+
+    for i, bow in enumerate(corpus):
+        topic_dist = lda.get_document_topics(bow)  # list of (topic_id, probability)
+        dominant_topic = max(topic_dist, key=lambda x: x[1])[0]  # find the top probability
+        topic_counts[dominant_topic] += 1  # add 1 to that topic's counter
+
+        # Get topic label (if you have topic_labels dict)
+        topic_label = topic_labels.get(dominant_topic, f"Topic {dominant_topic}")
+
+        # Get the text for this post (you can use bow_list[i] or original text if stored)
+        content_text = " ".join(bow_list[i])
+
+        # Store the info
+        doc_topics.append({
+            'content': content_text,
+            'dominant_topic': dominant_topic,
+            'topic_label': topic_label
+        })
+
+    # (Optional) Convert to DataFrame for sentiment analysis later
+    import pandas as pd
+    df_topics = pd.DataFrame(doc_topics)
+    print(f'Dataframe is:{df_topics}')
+
+    # Display number of posts per topic
+    for i, count in enumerate(topic_counts):
+        label = topic_labels.get(i, f"Topic {i}")
+        print(f"{label} ({i}): {count} posts")
+
+    return df_topics
+
+def sentiment_analysis():
+
+    import pandas as pd
+    import nltk
+    from nltk.sentiment.vader import SentimentIntensityAnalyzer
+    import matplotlib.pyplot as plt
+
+    # Download the VADER lexicon (once)
+    nltk.download('vader_lexicon', quiet=True)
+
+    #Load data from database
+    #contents = query_db('''
+    #    SELECT p.content
+    #    FROM posts p
+    #    UNION ALL
+    #    SELECT c.content
+    #    FROM comments AS c
+    #''')
+
+    #Convert to DataFrame
+    #df = pd.DataFrame(contents, columns=['text'])
+    #print(f'Dataframe is: {df}')
+
+    df = topics()
+    df = df.rename(columns={'content': 'text'})
+
+    # Initialize the VADER sentiment analyser
+    sia = SentimentIntensityAnalyzer()
+
+    # Calculate sentiment scores for each post
+    df['sentiment_score'] = df['text'].apply(lambda x: sia.polarity_scores(x)['compound'])
+
+    # Function to classify sentiment
+    def classify_sentiment(score):
+        if score >= 0.05:
+            return 'positive'
+        elif score <= -0.05:
+            return 'negative'
+        else:
+            return 'neutral'
+
+    # Apply classification
+    df['sentiment_label'] = df['sentiment_score'].apply(classify_sentiment)
+
+    # Count of each sentiment type
+    sentiment_summary = df['sentiment_label'].value_counts()
+    print(f'Sentiment summary is: {sentiment_summary}')
+
+    topic_summary = df.groupby(['topic_label', 'sentiment_label']).size().unstack(fill_value=0)
+    print(topic_summary)
+
+    # Return both DataFrame and summary
+    return sentiment_summary
+
+
+def user_reputation(user_id):
+    #Get user risk score (0–5)
+    user_risk_score = user_risk_analysis(user_id)
+
+    #Convert risk score to base reputation (invert: lower risk = higher base score)
+    base_reputation = (1.0 - (user_risk_score / 5.0)) * 50.0
+    if base_reputation < 0:
+        base_reputation = 0.0
+
+    # Optional debug print
+    #username = query_db('SELECT username FROM users WHERE id = ?', (user_id,), one=True)['username']
+    print(f'For User {user_id}:, the base score is: {base_reputation}')
+
+    # Engagement components
+    followers = query_db('SELECT COUNT(*) as c FROM follows WHERE followed_id = ?', (user_id,), one=True)['c'] or 0
+    posts_count = query_db('SELECT COUNT(*) as c FROM posts WHERE user_id = ?', (user_id,), one=True)['c'] or 0
+    reactions_count = query_db('''
+        SELECT COUNT(*) as c FROM reactions WHERE post_id IN (SELECT id FROM posts WHERE user_id = ?)
+    ''', (user_id,), one=True)['c'] or 0
+
+    # Engagement formula
+    engagement_score = (followers * 5.0) + (reactions_count * 0.5) + min(10, posts_count * 2.0)
+    engagement_score = min(50.0, engagement_score)  # cap at 50
+
+    #Final reputation
+    reputation = base_reputation + engagement_score
+    reputation = max(0.0, min(100.0, reputation))  # ensure 0–100
+
+    return int(round(reputation))
 
 
 if __name__ == '__main__':
